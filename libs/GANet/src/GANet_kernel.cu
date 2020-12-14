@@ -1,8 +1,9 @@
 //#include <torch/torch.h>
-#include <torch/extension.h>
 //#include <torch/serialize/tensor.h>
 //#include <ATen/ATen.h>
 //#include <ATen/cuda/CUDAContext.h>
+#include <torch/extension.h>
+
 
 #define CUDA_NUM_THREADS 256 
 #define THREADS_PER_BLOCK 64 
@@ -509,54 +510,65 @@ __global__ void sga_right_forward (const int n, const float *filters, const int 
 		   float *top_data){
 
   int index = blockIdx.x * blockDim.x + threadIdx.x;
-
+  // 注意,由于n = N * C * H，从这个if可以看出，作者共使用n = N * C * H个线程来处理一个batch
   if (index >= n)
     {
       return;
     }
   int step = height * width;
   //   int wsize=radius+1;
-
-  int base = index / height * step * depth + (index % height) * width;	//up->down
-  int fbase = index / height * step * wsize + (index % height) * width;
+  // 待聚合的代价体（top_data）维度为[N, C, D, H, W] = [N, 32, Dmax(=192/3), H, W],
+  // 注意：n = N * C * H = N*32*H,从作者的意图来看，使用一个线程处理"一个样本的、一行像素的、所有视差的"
+  // （即D维度和W维度，W维度体现了从左到右的聚合方向）的代价聚合
+  // base用于top_data（原始聚合代价）的索引
+  int base = index / height * step * depth + (index % height) * width;	//这是top_data[N, C, D=0, H, W=0]的内存索引，从此代价开始（遍历W和D）聚合。
+  // 聚合权重（filters）的维度为[N, C, wsize(=5), H, W] = (N, 32, 5, H, W), wsize维度对应论文公式（5）的权重w0~w4.
+  int fbase = index / height * step * wsize + (index % height) * width; //filters[N, C, wsize=0, H, W=0]的内存索引，从此权重开始（遍历wsize和W）聚合。
 
   int kp = 0;
-
+  // 遍历W维度，即对当前行像素的匹配代价，从左到右进行聚合
   for (int col = 0; col < width; col++)
     {
       int shift = fbase + col;
 //2
       int base0 = base + col;
+      // k用于保存当前像素的前一个像素的最大聚合代价对应的视差
       int k = kp;
       kp = 0;
 //2
+     // 遍历D(视差)维度，即
       for (int d = 0; d < depth; d++)
 	{
 	  float temp = 0;
 	  int location = base + d * step + col;
+	  // 论文公式（5）的第一项
 	  temp += top_data[location] * filters[shift];
+	  // 论文公式（5）的第二项
 	  if (col - 1 >= 0)
 	    temp += top_data[location - 1] * filters[shift + step];
 	  else
 	    temp += top_data[location] * filters[shift + step];
-
-	  if (col - 1 >= 0 && d - 1 >= 0)
+      // 论文公式（5）的第三项
+	  if (col - 1 >= 0 && d - 1 >= 0)  // 注意，由于公式（5）的要用到d-1，这里d=0时需特殊处理, 特别注意反向传播时的处理，要与这里对应！！！
 	    temp += top_data[location - 1 - step] * filters[shift + 2 * step];
 	  else
 	    temp += top_data[location] * filters[shift + 2 * step];
-	  if (col - 1 >= 0 && d + 1 < depth)
+	  // 论文公式（5）的第四项
+	  if (col - 1 >= 0 && d + 1 < depth) // 注意，由于公式（5）的要用到d+1，这里d=depth-1时需特殊处理, 特别注意反向传播时的处理，要与这里对应！！！
 	    temp += top_data[location - 1 + step] * filters[shift + 3 * step];
 	  else
 	    temp += top_data[location] * filters[shift + 3 * step];
 
 //3
+      // 论文公式（5）的第五项。 变量k保存着当前像素的前一个像素的最大聚合代价对应的视差（为公式（5）中的max函数服务）
 	  if (col - 1 >= 0)
 	    temp +=
 	      top_data[base0 - 1 + k * step] * filters[shift + 4 * step];
 	  else
 	    temp += top_data[location] * filters[shift + 4 * step];
-	  top_data[location] = temp;
 
+	  top_data[location] = temp;
+      // 记录当前像素的最大聚合代价对应的视差，供下一个像素使用。
 	  if (top_data[base0 + kp * step] < temp)
 	    kp = d;
 //3
@@ -564,51 +576,75 @@ __global__ void sga_right_forward (const int n, const float *filters, const int 
     }
 }
 
+// SGA的反向传播核心代码：针对本层的输入数据（即待聚合的代价体）
+// input.size()=[num,channel,depth,height,width]
+//  int num = input.size(0);
+//  int channel = input.size(1);
+//  int depth = input.size(2);
+//  int height = input.size(3);
+//  int width = input.size(4);
+//  int wsize = guidance_down.size(2);
+//  n = num * channel * height;
+// filters：聚合权重（聚合聚合方向为:左-->右）。已知量！！！
+// idx:维度和input的空间维度相同（不包含depth即视差维度）[num,channel,height,width]，用于记录各个通道上各个像素的最大代价对应的视差。已知量。
+// top_diff：loss对于本层输出量的导数（注意，已经考虑了公式（6），将未被选中为输出聚合代价的地方mask为0了（使用的是get_temp_grad（）函数））。已知量。
+// bottom_diff：loss对于本层输入量input的导数，维度和input一致。待求量！！！
+// g0/g1/g2/g3为四个方向的聚合权重矩阵，其维度为(N, 32, 5, H, W), 故wsize=5（对应公式（5）中的w0~w4）
+// 故wsize=5（对应公式（5）中的w0~w5）
 __global__ void sga_right_data_backward (const int n, const float *filters, float *top_diff,
 			 const float *idx, const int height, const int width,
 			 const int depth, const int wsize, float *bottom_diff){
 
   int index = blockIdx.x * blockDim.x + threadIdx.x;
+  // 由于n = num * channel * height以及下面的这个n和线程索引的比较，可以得出，作者用一个GPU线程处理一行像素的一个通道的代价聚合。
   if (index >= n)
     {
       return;
     }
+  // 注意，由于input.size()=[num,channel,depth,height,width]，
+  // 特定的一行像素的特定的通道对应的视差在input中的索引为[num, channel, :, height, :]，
+  // 特定的一个像素的特定的通道对应的视差在input中的索引为[num, channel, :, height, width]。
+  // 同一个像素的特定通道的两个相邻视差的内存地址的差异。
   int step = height * width;
-  int base = index / height * step * depth + (index % height) * width;	//up->down
+  // input的当前通道当前行的第一个像素的第一个视差值的内存索引。input的维度为[num,channel,depth,height,width]
+  int base = index / height * step * depth + (index % height) * width;	//left->right
+  // input的当前通道当前行的第一个像素的第一个聚合权重（一个像素5个权重，即w0~w4）的内存索引。聚合权重的维度为(N, 32, 5, H, W)
   int fbase = index / height * step * wsize + (index % height) * width;
 //1
+  // input的当前通道当前行的第一个像素的最大代价对应的视差值。idx的维度为[num,channel,height,width]
   int base_idx = index / height * step + (index % height) * width;
-//
+// 对当前通道当前行的梯度进行反向传播：从行尾向行首遍历，依次计算关于输入数据input的导数。[num, channel, :, height, ：]
   for (int col = width - 1; col >= 0; col--)
     {
-      int shift = fbase + col;
+      int shift = fbase + col; // 当前通道当前行第col个像素的第一个聚合权重的索引：[num, 32, 0, height, col]
+      // 对于当前像素，遍历它的视差：[num, channel, :, height, width]
       for (int d = 0; d < depth; d++)
 	{
-	  int location = base + d * step + col;
-	  float temp = top_diff[location];
+	  int location = base + d * step + col; // 当前通道当前行第col个像素像素当前视差代价的索引：[num, channel, d, height, col]
+	  float temp = top_diff[location]; // 公式12中的第一项
 	  if (col + 1 < width)
-	    temp += top_diff[location + 1] * filters[shift + 1 + step];
+	    temp += top_diff[location + 1] * filters[shift + 1 + step];  // 公式12中sum中的第一项
 	  if (col + 1 < width && d + 1 < depth)
 	    temp +=
-	      top_diff[location + 1 + step] * filters[shift + 1 + 2 * step];
+	      top_diff[location + 1 + step] * filters[shift + 1 + 2 * step]; // 公式12中sum中的第二项
 	  if (col + 1 < width && d - 1 >= 0)
 	    temp +=
-	      top_diff[location + 1 - step] * filters[shift + 1 + 3 * step];
+	      top_diff[location + 1 - step] * filters[shift + 1 + 3 * step]; // 公式12中sum中的第三项
 	  top_diff[location] = temp;
-	  bottom_diff[location] += (temp * filters[shift]);
+	  bottom_diff[location] += (temp * filters[shift]); // 公式10。注意针对聚合方向r的累加。
 	}
 //2
       if (col + 1 < width)
 	{
-	  int k = idx[base_idx + col];
-	  int location = base + k * step + col;
+	  int k = idx[base_idx + col];  // 当前像素的最大代价对应的视差值索引。idx的维度为[num,channel,height,width]
+	  int location = base + k * step + col; // 当前像素的最大代价值的索引
 	  float temp = 0;
 	  for (int d = 0; d < depth; d++)
 	    temp +=
 	      top_diff[base + col + 1 + d * step] * filters[shift + 1 +
-							    4 * step];
+							    4 * step]; // 公式13中sum中的第四项
 	  top_diff[location] += temp;
-	  bottom_diff[location] += temp * filters[shift];
+	  bottom_diff[location] += temp * filters[shift]; // 公式10中
 	}
 //2     
     }
@@ -631,14 +667,28 @@ __global__ void sga_right_data_backward (const int n, const float *filters, floa
 	}*/
   for (int col = 0; col < width; col++)
     {
+      // 遍历当前通道的当前行的像素，处理边界部分的求导（视差为0时的导数，以及最大视差（d=depth-1）时的导数。这与公式（5）中使用了r-1, d-1有关。）
+      // 在前项传播时亦做了特殊处理，这里与之对应。
       int shift = fbase + col;
       int location = base + col;
-      bottom_diff[location] += top_diff[location] * filters[shift + 2 * step];
-      location += (depth - 1) * step;
-      bottom_diff[location] += top_diff[location] * filters[shift + 3 * step];
+      bottom_diff[location] += top_diff[location] * filters[shift + 2 * step];  // 因为视差为0，即d=0时的导数尚未加入。
+      location += (depth - 1) * step; // 当前像素的最大视差（depth-1）对应的代价的索引
+      bottom_diff[location] += top_diff[location] * filters[shift + 3 * step]; // 因为视差为最大值，即d=Dmax时的导数尚未加入。
     }
 }
 
+
+// SGA的反向传播核心代码：针对本层的聚合权重求导
+// input.size()=[num,channel,depth,height,width]
+//  n = num * channel * height * width;
+// bottom_data: 输入数据input。input.size()=[num,channel,depth,height,width]
+// top_data：输出数据。维度和input一致[num,channel,depth,height,width]
+// filters：聚合权重（聚合聚合方向为:左-->右）。已知量！！！
+// idx:维度和input的空间维度相同（不包含depth即视差维度）[num,channel,height,width]，用于记录各个通道上各个像素的最大代价对应的视差。已知量。
+// temp_diff：loss对于本层输出量的导数(注意，已经考虑了公式(6)，将未被选中为输出聚合代价的地方mask为0了(使用的是get_temp_grad()函数))。已知量。
+// filters_diff：loss对于本层聚合权重的导数（左-->右聚合），维度和聚合权重一致。待求量！！！
+// g0/g1/g2/g3为四个方向的聚合权重矩阵，其维度为(N, 32, 5, H, W), 故wsize=5（对应公式（5）中的w0~w4）
+// 故wsize=5（对应公式（5）中的w0~w5）
 __global__ void sga_right_weight_backward (const int n, const float *bottom_data,
 			   const float *top_data, const float *temp_diff,
 			   const float *idx, const int height,
@@ -646,32 +696,40 @@ __global__ void sga_right_weight_backward (const int n, const float *bottom_data
 			   float *filters_diff){
 
   int index = blockIdx.x * blockDim.x + threadIdx.x;
+  // 因为n = num * channel * height * width，由此可以看出，
+  // 作者使用一个GPU线程处理一个像素一个通道的权重求导(求不同视差下的导数并求和，公式(11))：[num,channel, :, height,width]
   if (index >= n)
     {
       return;
     }
   int step = height * width;
-  int base = index / step * step * depth + index % step;	//up->down
+  // 当前像素，视差为0对应的代价索引，即[num,channel,0, h,w]
+  int base = index / step * step * depth + index % step;	//left->right
+  // 当前像素，视差为0对应的代价的聚合权重w0，即[num,channel,0, h,w]
   int fbase = index / step * step * wsize + index % step;
 
   //   int row = index%step/width;
   int col = index % step % width;
+  // 遍历视差，求导数，求和。即公式(11)的第一个等式。
   for (int i = 0; i < depth; i++)
     filters_diff[fbase] +=
       temp_diff[base + i * step] * bottom_data[base + i * step];
   if (col - 1 >= 0)
     {
+      // 遍历视差，求导数，求和。即公式(11)的第二个等式。
       int location = fbase + step;
       for (int i = 0; i < depth; i++)
 	filters_diff[location] +=
 	  temp_diff[base + i * step] * top_data[base + i * step - 1];
 
+      // 遍历视差，求导数，求和。即公式(11)的第三个等式。注意，这里针对d=0（=0）的情形，需要单独处理下。要和前向传播对应
       location = fbase + 2 * step;
       filters_diff[location] += temp_diff[base] * bottom_data[base];
       for (int i = 1; i < depth; i++)
 	filters_diff[location] +=
 	  temp_diff[base + i * step] * top_data[base + (i - 1) * step - 1];
 
+      // 遍历视差，求导数，求和。即公式(11)的第四个等式。注意这里针对d=depth-1（i=depth-1）的情形需要单独处理下。要和前向传播对应
       location = fbase + 3 * step;
       filters_diff[location] +=
 	temp_diff[base + (depth - 1) * step] * bottom_data[base +
@@ -702,6 +760,7 @@ __global__ void sga_right_weight_backward (const int n, const float *bottom_data
 //1
   if (col - 1 >= 0)
     {
+      // 公式(11)的第五项
       int location = fbase + 4 * step;
       int k = idx[index - 1];
       for (int i = 0; i < depth; i++)
@@ -1034,6 +1093,18 @@ void sga_kernel_backward (at::Tensor input, at::Tensor guidance_down,
 
   float *idx = max_idx.data<float>();
 
+// input：本层的输入数据，即未经聚合的原始代价体。已知量。
+// grad0：聚合权重的导数（聚合聚合方向为:下-->上）。待求量！！！
+// grad1：聚合权重的导数（聚合聚合方向为:左-->右）。待求量！！！
+// grad2：聚合权重的导数（聚合聚合方向为:上-->下）。待求量！！！
+// grad3：聚合权重的导数（聚合聚合方向为:右-->左）。待求量！！！
+// temp_grad：和input的维度相同，用于临时保存对input的导数！！！
+// mask：维度和input相同。用于记录本层的输出数据（top_data）是从哪个聚合方向得到的（从四个方向选取最大聚合代价值，作为前向传播的输出）。已知量。
+// max_idx:维度和input的空间维度相同（不包含depth即视差维度），用于记录各个通道上各个像素的最大代价对应的视差。已知量。
+// gradInput：input的导数。维度和input一致。待求量！！！
+// gradOutput：loss对于本层输出量的导数。已知量。
+// g0/g1/g2/g3为四个方向的聚合权重矩阵，其维度为(N, 32, 5, H, W), 故wsize=5（对应公式（5）中的w0~w5）
+
   int N = input.numel ();
 //      cudaStream_t stream = at::cuda::getCurrentCUDAStream(); 
 
@@ -1108,6 +1179,7 @@ void sga_kernel_backward (at::Tensor input, at::Tensor guidance_down,
   n = num * channel * height;
   cudaMemcpy (top_temp, bottom_data, sizeof (float) * N,
 	      cudaMemcpyDeviceToDevice);
+  // 从这里可以看出，作者使用n = num * channel * height个线程来做sga_right_forward。
   sga_right_forward <<< (n + CUDA_NUM_THREADS - 1) / CUDA_NUM_THREADS,
     CUDA_NUM_THREADS >>> (n, g2, height, width, depth, wsize, top_temp);
 
